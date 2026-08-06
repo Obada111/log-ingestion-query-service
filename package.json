@@ -1,0 +1,35 @@
+{
+  "name": "log-service",
+  "version": "1.0.0",
+  "description": "High-throughput log ingestion, query and aggregation service",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node --import tsx --test \"tests/unit/*.test.ts\"",
+    "test:integration": "node --import tsx --test --test-concurrency=1 \"tests/integration/*.test.ts\"",
+    "smoke": "node scripts/smoke.mjs",
+    "loadtest": "node loadtest/loadgen.mjs"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "fastify": "^5.2.1",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0"
+  }
+}

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.git/
+tests/
+loadtest/
+scripts/
+*.md
+.env
