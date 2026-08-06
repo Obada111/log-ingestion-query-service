@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests (no DB)
+        run: npm run test
+
+      - name: Start stack (default config)
+        run: docker compose up -d
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf localhost:8080/health; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Integration tests (real DB)
+        run: npm run test:integration
+
+      - name: Contract smoke (auth off)
+        run: node scripts/smoke.mjs
+
+      - name: Contract smoke (auth on)
+        run: |
+          docker compose down
+          AUTH_ENABLED=true LOADGEN_API_KEY=loadgen-test-key docker compose up -d
+          for i in $(seq 1 60); do
+            if curl -sf localhost:8080/health; then break; fi
+            sleep 2
+          done
+          node scripts/smoke.mjs --auth --key loadgen-test-key
