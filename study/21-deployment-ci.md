@@ -271,7 +271,7 @@ A: Defense in depth: if the process is compromised, a non-root process limits wh
 A: It gates app startup on the DB's `pg_isready` healthcheck, so the app's own `waitForDatabase` retry loop almost never spins. Without it, every boot is a race that the retry loop silently papers over.
 
 **Q: Walk through the CI pipeline.**
-A: On push/PR: checkout, Node 22 with npm cache, `npm ci`, typecheck, lint, 35 unit tests (no DB). Then the real stack: `docker compose up -d`, poll `/health`, run 39 integration tests against the compose DB, run the contract smoke with auth off, then `compose down` and up with `AUTH_ENABLED=true LOADGEN_API_KEY=loadgen-test-key`, poll health, and run the smoke with auth on. Everything runs in `implementation/` via `defaults.run.working-directory`.
+A: On push/PR: checkout, Node 22 with npm cache, `npm ci`, typecheck, lint, 35 unit tests (no DB). Then the real stack: `docker compose up -d`, poll `/health`, run 39 integration tests against the compose DB, run the contract smoke with auth off, then `compose down` and up with `AUTH_ENABLED=true LOADGEN_API_KEY=loadgen-test-key`, poll health, and run the smoke with auth on. Everything runs from the repository root (the workflow sets no `working-directory`).
 
 **Q: Why run integration tests against the compose stack rather than a CI database service?**
 A: Because the tests must verify the deployed artifact — same image, same `shared_buffers`, same caps. A separate DB service would test against a configuration that never runs in the graded environment, which is exactly how "works in CI, fails in prod" bugs are born.

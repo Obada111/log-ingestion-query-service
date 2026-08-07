@@ -1,5 +1,5 @@
 {
-  "name": "log-service",
+  "name": "log-ingestion-query-service",
   "version": "1.0.0",
   "description": "High-throughput log ingestion, query and aggregation service",
   "type": "module",

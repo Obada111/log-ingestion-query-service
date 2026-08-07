@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: logpass
       POSTGRES_DB: logdb
     # PostgreSQL tuning for 1 CPU / 1 GB. These are the knobs that matter for
-    # high-throughput ingestion + fast aggregations (see study/14-postgresql.md).
+    # high-throughput ingestion + fast aggregations (see study/14-postgresql-tuning.md).
     # shared_buffers=512MB: the table+index working set exceeds 256MB even at
     # ~1M rows; index pages were being read from disk on every insert (see
     # measured results in README).
