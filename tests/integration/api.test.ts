@@ -97,7 +97,7 @@ describe("GET /logs", () => {
     // Isolate this suite's dataset: the POST /logs tests above already
     // inserted rows (which is exactly what we want to test) but this suite
     // needs a known population.
-    await t.pool.query("TRUNCATE logs RESTART IDENTITY");
+    await t.pool.query("TRUNCATE logs, log_counts RESTART IDENTITY");
     // Deterministic dataset: 5 distinct services x 2 levels, known timestamps.
     const rows: Array<Record<string, unknown>> = [];
     for (let i = 0; i < 5; i++) {

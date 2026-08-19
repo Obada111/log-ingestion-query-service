@@ -204,8 +204,20 @@ export function buildLogsWhere(opts: WhereOptions): { sql: string; params: unkno
   if (filters.service) clauses.push(`service = ${t(filters.service)}`);
   if (filters.level) clauses.push(`level = ${t(filters.level)}`);
   for (const [key, value] of filters.attrPairs) {
-    // String comparison against the canonicalized lookup column — indexed by GIN.
-    clauses.push(`attr_lookup @> ${t(JSON.stringify({ [key]: value }))}::jsonb`);
+    // Typed attribute probe (migration 0005): stored documents keep the
+    // client's original JSON types but query values arrive as strings, so
+    // match the string form plus any exact number/boolean representation of
+    // it. OR'd jsonb @> probes, all served by the attributes GIN index.
+    const probes: string[] = [];
+    const numeric = Number(value);
+    if (value !== "" && !Number.isNaN(numeric)) {
+      probes.push(`attributes @> ${t(JSON.stringify({ [key]: numeric }))}::jsonb`);
+    }
+    if (value === "true" || value === "false") {
+      probes.push(`attributes @> ${t(JSON.stringify({ [key]: value === "true" }))}::jsonb`);
+    }
+    probes.push(`attributes @> ${t(JSON.stringify({ [key]: value }))}::jsonb`);
+    clauses.push(`(${probes.join(" OR ")})`);
   }
   if (filters.q) {
     // ESCAPE '\' makes user-supplied % _ \ literals; substring is matched
@@ -264,7 +276,37 @@ export interface AggregateQuery {
   params: unknown[];
 }
 
+/**
+ * Aggregation builder with two execution paths:
+ *
+ * - ROLLUP (default): when only service/level filters are present, the
+ *   window is answered from the 1-second `log_counts` rollup maintained by
+ *   the ingest writer (see migration 0004). Whole aligned 1-second buckets
+ *   inside [since, until) come from the rollup; the two sub-second edges
+ *   (<= 1s of logs each, regardless of window size) come from direct index
+ *   scans. Exact for every window, and O(buckets + edges) instead of
+ *   O(rows) — a 1-hour aggregate at 15k logs/s scans ~15k rows, not ~54M.
+ *
+ * - SCAN (fallback): when attr.* or q filters are present, the rollup
+ *   cannot answer them — fall back to scanning the window directly
+ *   (correct, but O(window rows)).
+ */
 export function buildAggregateQuery(opts: {
+  filters: ListFilters;
+  since: Date;
+  until: Date;
+  bucket: Bucket;
+  groupBy: GroupColumn | null;
+  tenantId?: TenantScope;
+}): AggregateQuery {
+  if (opts.filters.attrPairs.length > 0 || opts.filters.q !== undefined) {
+    return buildAggregateScanQuery(opts);
+  }
+  return buildAggregateRollupQuery(opts);
+}
+
+/** Historical direct-scan path (attr/q filters, small windows). */
+function buildAggregateScanQuery(opts: {
   filters: ListFilters;
   since: Date;
   until: Date;
@@ -291,5 +333,80 @@ export function buildAggregateQuery(opts: {
            ${groupByClause}
            ORDER BY 1 ASC, 2 ASC`,
     params: [...where.params, BUCKET_INTERVALS[opts.bucket]],
+  };
+}
+
+/** Rollup path: whole 1s buckets from log_counts + sub-second edge scans. */
+function buildAggregateRollupQuery(opts: {
+  filters: ListFilters;
+  since: Date;
+  until: Date;
+  bucket: Bucket;
+  groupBy: GroupColumn | null;
+  tenantId?: TenantScope;
+}): AggregateQuery {
+  // service/level filters + logs-table tenant semantics (NULL rows are
+  // "no tenant"). since/until are handled by the rollup/edge bounds below.
+  const where = buildLogsWhere({
+    filters: { ...opts.filters, since: undefined, until: undefined },
+    tenantId: opts.tenantId,
+  });
+  const params = [...where.params];
+  const t = (v: unknown): string => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+  const sinceP = t(opts.since);
+  const untilP = t(opts.until);
+  const bucketP = t(BUCKET_INTERVALS[opts.bucket]);
+
+  // The rollup stores '' for tenantless rows (NULLs are distinct in UNIQUE
+  // constraints — see migration 0004); the edge scans keep logs-table
+  // semantics (tenant_id IS NULL) via `where.sql`.
+  let rollupTenantSql = "";
+  if (opts.tenantId === null) rollupTenantSql = " AND tenant_id = ''";
+  else if (typeof opts.tenantId === "string") rollupTenantSql = ` AND tenant_id = ${t(opts.tenantId)}`;
+
+  const groupExpr = opts.groupBy ?? "NULL::text";
+  // Edge parts aggregate the raw window: group by the bucket expression
+  // (and the grouping column when one is requested).
+  const edgeGroupBy = opts.groupBy ? "GROUP BY 1, " + opts.groupBy : "GROUP BY 1";
+  const filtersSql = where.sql.replace(/^WHERE /, " AND ");
+  // ceil-second(since) and floor-second(until): interior rollup bounds.
+  // Explicit ::timestamptz casts disambiguate the + operator (otherwise the
+  // parser considers interval + interval and errors on date_bin's overloads).
+  const ceilSince = `date_bin(interval '1 second', ${sinceP}::timestamptz + interval '1 second', TIMESTAMPTZ 'epoch')`;
+  const floorUntil = `date_bin(interval '1 second', ${untilP}::timestamptz, TIMESTAMPTZ 'epoch')`;
+  const bucketExpr = `date_bin(${bucketP}::interval, ts, TIMESTAMPTZ 'epoch')`;
+
+  return {
+    sql: `SELECT bucket_start, group_name, sum(count)::int AS count
+            FROM (
+              SELECT date_bin(${bucketP}::interval, bucket_ts, TIMESTAMPTZ 'epoch') AS bucket_start,
+                     ${groupExpr} AS group_name, count
+                FROM log_counts
+               WHERE bucket_ts >= ${ceilSince}
+                 AND bucket_ts <  ${floorUntil}
+                 ${filtersSql}${rollupTenantSql}
+              UNION ALL
+              SELECT ${bucketExpr}, ${groupExpr}, count(*)
+                FROM logs
+               WHERE ts >= ${sinceP}
+                 AND ts < ${ceilSince}
+                 AND ts < ${untilP}
+                 ${filtersSql}
+               ${edgeGroupBy}
+              UNION ALL
+              SELECT ${bucketExpr}, ${groupExpr}, count(*)
+                FROM logs
+               WHERE ts >= ${floorUntil}
+                 AND ts >= ${sinceP}
+                 AND ts < ${untilP}
+                 ${filtersSql}
+               ${edgeGroupBy}
+            ) t
+           GROUP BY bucket_start, group_name
+           ORDER BY 1 ASC, 2 ASC`,
+    params,
   };
 }

@@ -38,30 +38,35 @@ interface PendingBatch {
 }
 
 /**
- * Bulk INSERT via unnest. attr_lookup (the string-valued copy used for
- * attribute filters) is derived in SQL rather than in the app, keeping the
- * CPU-capped app on a single JSON.stringify per row.
+ * Bulk INSERT via unnest. Attributes are stored typed (contract: clients
+ * receive original types) and attribute filters probe the same JSONB with
+ * typed match documents (see lib/queryParams), so no canonicalized copy
+ * column is needed and the app pays exactly one JSON.stringify per row.
  */
 const INSERT_SQL = `
-  INSERT INTO logs (ts, level, service, message, attributes, attr_lookup, tenant_id)
-  SELECT u.ts, u.level, u.service, u.message, u.attrs, lk.lookup, u.tenant
-  FROM unnest(
+  INSERT INTO logs (ts, level, service, message, attributes, tenant_id)
+  SELECT * FROM unnest(
     $1::timestamptz[], $2::text[], $3::text[], $4::text[],
     $5::jsonb[], $6::text[]
   ) AS u(ts, level, service, message, attrs, tenant)
-  CROSS JOIN LATERAL (
-    SELECT COALESCE(
-      jsonb_object_agg(
-        e.key,
-        CASE WHEN jsonb_typeof(e.value) IN ('object', 'array')
-             THEN e.value::text
-             ELSE e.value #>> '{}'
-        END
-      ),
-      '{}'::jsonb
-    ) AS lookup
-    FROM jsonb_each(u.attrs) AS e(key, value)
-  ) lk
+`;
+
+/**
+ * Rollup upsert for the SAME chunk rows, grouped into epoch-aligned
+ * 1-second buckets. Runs in the same transaction as the logs INSERT, so
+ * counts are exact at all times. tenant_id '' = no tenant (see migration
+ * 0004). Cost: a few hundred upsert rows per chunk.
+ */
+const INSERT_COUNTS_SQL = `
+  INSERT INTO log_counts (bucket_ts, service, level, tenant_id, count)
+  SELECT date_bin('1 second', u.ts, TIMESTAMPTZ 'epoch'),
+         u.service, u.level, COALESCE(u.tenant, ''), count(*)
+  FROM unnest(
+    $1::timestamptz[], $2::text[], $3::text[], $4::text[]
+  ) AS u(ts, service, level, tenant)
+  GROUP BY 1, 2, 3, 4
+  ON CONFLICT (bucket_ts, service, level, tenant_id)
+  DO UPDATE SET count = log_counts.count + EXCLUDED.count
 `;
 
 export class IngestWriter {
@@ -164,8 +169,11 @@ export class IngestWriter {
   }
 
   /**
-   * Execute the bulk INSERT. Constant SQL text => node-pg reuses the
-   * server-side prepared statement, skipping re-parsing on every call.
+   * Execute the bulk INSERT plus the rollup upsert in ONE transaction:
+   * the read pool never sees logs without their counts, and a failed
+   * chunk rolls both back together (the retry cannot double-count).
+   * Constant SQL text => node-pg reuses the server-side prepared
+   * statements, skipping re-parsing on every call.
    */
   private async insertRows(rows: IngestRow[]): Promise<void> {
     if (rows.length === 0) return;
@@ -186,7 +194,18 @@ export class IngestWriter {
       tenants[i] = row.tenantId;
     }
 
-    await this.pool.query(INSERT_SQL, [ts, levels, services, messages, attributes, tenants]);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(INSERT_SQL, [ts, levels, services, messages, attributes, tenants]);
+      await client.query(INSERT_COUNTS_SQL, [ts, services, levels, tenants]);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   /** Number of rows waiting to be flushed (diagnostics/tests). */

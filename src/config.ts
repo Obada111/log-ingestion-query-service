@@ -47,10 +47,12 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     retentionSweepIntervalMs: int("RETENTION_SWEEP_INTERVAL_MS", 15 * 60 * 1000, 1000, 24 * 3600 * 1000),
     ingestMaxFlushWaitMs: int("INGEST_MAX_FLUSH_WAIT_MS", 10, 1, 1000),
     // Target chunk size, not a hard cap: a single oversized request still
-    // flushes alone. 2000 rows ≈ 80ms on a 1-CPU container vs ~72ms for 500
-    // rows — index maintenance dominates, so big chunks are far cheaper.
-    // With size-triggered flushing this sustains ~25k rows/s serially.
-    ingestMaxRowsPerFlush: int("INGEST_MAX_ROWS_PER_FLUSH", 2000, 100, 100_000),
+    // flushes alone. Bigger chunks amortize the fixed per-statement cost
+    // (executor setup + commit) across more rows — with
+    // synchronous_commit=off the remaining fixed cost is small, and 5000
+    // rows keeps the serial writer's ceiling well above the 15k/s target
+    // even on slower single-CPU containers.
+    ingestMaxRowsPerFlush: int("INGEST_MAX_ROWS_PER_FLUSH", 5000, 100, 100_000),
     authEnabled: env("AUTH_ENABLED") === "true",
     loadgenApiKey: env("LOADGEN_API_KEY") === "" ? undefined : env("LOADGEN_API_KEY"),
     isProd: env("NODE_ENV") === "production",

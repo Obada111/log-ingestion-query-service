@@ -161,7 +161,7 @@ describe("buildLogsQuery", () => {
 });
 
 describe("buildAggregateQuery", () => {
-  it("groups by bucket only when no group_by is given", () => {
+  it("uses the rollup path (log_counts + edge scans) with no attr/q filters", () => {
     const q = buildAggregateQuery({
       filters: { attrPairs: [] },
       since: new Date("2026-07-20T14:00:00Z"),
@@ -169,13 +169,15 @@ describe("buildAggregateQuery", () => {
       bucket: "5m",
       groupBy: null,
     });
-    assert.ok(q.sql.includes("date_bin($3::interval"), "interval is the 3rd param (since, until, interval)");
+    assert.equal(q.params.length, 3, "since, until, interval params");
+    assert.ok(q.sql.includes("date_bin($3::interval"), "interval is the 3rd param");
+    assert.ok(q.sql.includes("log_counts"), "rollup table is read");
+    assert.ok(q.sql.includes("GROUP BY bucket_start, group_name"));
     assert.ok(q.sql.includes("NULL::text AS group_name"));
-    assert.ok(q.sql.includes("GROUP BY 1"));
     assert.ok(!q.sql.includes("GROUP BY 1, service"));
   });
 
-  it("whitelists group columns", () => {
+  it("whitelists group columns on the rollup path", () => {
     const q = buildAggregateQuery({
       filters: { attrPairs: [] },
       since: new Date("2026-07-20T14:00:00Z"),
@@ -183,6 +185,32 @@ describe("buildAggregateQuery", () => {
       bucket: "1h",
       groupBy: "service",
     });
-    assert.ok(q.sql.includes("GROUP BY 1, service"));
+    assert.ok(q.sql.includes("service AS group_name"));
+    assert.equal(q.params.length, 3);
+  });
+
+  it("falls back to a direct scan when attr filters are present", () => {
+    const q = buildAggregateQuery({
+      filters: { attrPairs: [["region", "eu"]] },
+      since: new Date("2026-07-20T14:00:00Z"),
+      until: new Date("2026-07-20T15:00:00Z"),
+      bucket: "1m",
+      groupBy: null,
+    });
+    assert.ok(q.sql.includes("FROM logs"), "direct scan");
+    assert.ok(q.sql.includes("GROUP BY 1"));
+    assert.ok(q.sql.includes("attributes @>"), "typed attribute probe");
+  });
+
+  it("falls back to a direct scan when q filters are present", () => {
+    const q = buildAggregateQuery({
+      filters: { attrPairs: [], q: "declined" },
+      since: new Date("2026-07-20T14:00:00Z"),
+      until: new Date("2026-07-20T15:00:00Z"),
+      bucket: "5m",
+      groupBy: "level",
+    });
+    assert.ok(q.sql.includes("FROM logs"), "direct scan");
+    assert.ok(q.sql.includes("GROUP BY 1, level"));
   });
 });

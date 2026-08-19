@@ -35,7 +35,7 @@ export async function setupTestApp(overrides: Partial<Config> = {}): Promise<Tes
   const pool = createPool(config);
   await runMigrations(pool);
   // Clean slate, preserving the sequence for predictable ids.
-  await pool.query("TRUNCATE logs, api_keys RESTART IDENTITY");
+  await pool.query("TRUNCATE logs, api_keys, log_counts RESTART IDENTITY");
 
   const writer = createWriter(pool, config);
   const readyState = { ready: true };

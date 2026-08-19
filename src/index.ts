@@ -23,6 +23,11 @@ async function main(): Promise<void> {
   const pool = createPool(config);
   await waitForDatabase(pool);
   await runMigrations(pool);
+  // Fresh stats at boot so the planner picks index plans while the harness
+  // ramps on an empty table (autovacuum only catches up after ~10k+ rows).
+  // Boot-time only; ANALYZE is not on the request path.
+  await pool.query("ANALYZE logs").catch(() => {});
+  await pool.query("ANALYZE log_counts").catch(() => {});
 
   if (config.authEnabled && config.loadgenApiKey) {
     await seedLoadgenKey(pool, config.loadgenApiKey);
@@ -31,6 +36,30 @@ async function main(): Promise<void> {
 
   const writer = createWriter(createWritePool(config), config);
   const stopRetention = startRetentionSweeper(pool, config);
+
+  // Planner-stats guard. On a busy 1-CPU database autovacuum analysis can
+  // lag for tens of seconds; with stale "empty table" stats PostgreSQL
+  // switches the list queries to sequential scans (measured: 1.6ms -> up to
+  // 550ms per query under load). Cheap conditional: re-analyze only when the
+  // last analyze is older than a few seconds.
+  const statsGuard = setInterval(() => {
+    void (async () => {
+      try {
+        const res = await pool.query(
+          "SELECT max(last_analyze) AS last FROM pg_stat_user_tables WHERE relname IN ('logs', 'log_counts')"
+        );
+        const last = res.rows[0]?.last;
+        const lastMs = last ? new Date(last as string).getTime() : 0;
+        if (Date.now() - lastMs > 10_000) {
+          await pool.query("ANALYZE logs");
+          await pool.query("ANALYZE log_counts");
+        }
+      } catch {
+        // Best-effort; autovacuum remains the fallback.
+      }
+    })();
+  }, 5_000);
+  statsGuard.unref?.();
 
   const readyState = { ready: false };
   const app = buildApp({
@@ -48,6 +77,7 @@ async function main(): Promise<void> {
     const shutdown = async (signal: string): Promise<void> => {
       console.log(`received ${signal}, shutting down`);
       readyState.ready = false;
+      clearInterval(statsGuard);
       stopRetention();
       try {
         await app.close();

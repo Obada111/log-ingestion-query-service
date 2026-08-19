@@ -12,7 +12,10 @@ export function createPool(config: Config): pg.Pool {
   const pool = new pg.Pool({
     connectionString: config.databaseUrl,
     max: config.pgPoolMax,
-    connectionTimeoutMillis: 5_000,
+    // Generous acquire timeout: on a saturated single-CPU database, queries
+    // may legitimately wait for a client; failing at 5s turned short
+    // congestion into HTTP 500s under load.
+    connectionTimeoutMillis: 15_000,
     idleTimeoutMillis: 30_000,
     application_name: "log-service",
     // Guarantee bucket alignment: date_bin/date_trunc of timestamptz are
@@ -34,7 +37,7 @@ export function createWritePool(config: Config): pg.Pool {
   const pool = new pg.Pool({
     connectionString: config.databaseUrl,
     max: config.pgWritePoolMax,
-    connectionTimeoutMillis: 5_000,
+    connectionTimeoutMillis: 15_000,
     idleTimeoutMillis: 30_000,
     application_name: "log-service-writer",
     options: "-c timezone=UTC",

@@ -14,6 +14,28 @@ services:
     # shared_buffers=512MB: the table+index working set exceeds 256MB even at
     # ~1M rows; index pages were being read from disk on every insert (see
     # measured results in README).
+    # WAL durability / commit cost. synchronous_commit=off makes COMMIT
+    # return before the WAL is fsynced (the wal writer flushes in the
+    # background), which removes the ~70ms fixed fsync cost per INSERT
+    # chunk on slow disks. Committed rows are still immediately visible
+    # to readers (read-after-write, eventual consistency), so the API
+    # contract is unaffected; the trade-off is that a crash can lose the
+    # most recent ~200ms of acknowledged writes — standard practice for
+    # log ingestion systems (Loki/ClickHouse style). wal_compression
+    # shrinks WAL for the JSONB-heavy rows. Longer checkpoint_timeout
+    # avoids mid-run checkpoint stalls. gin_pending_list_limit: the GIN
+    # index on attr_lookup uses fastupdate — INSERTs append entries to an
+    # in-memory pending list, and the list is flushed into the index (the
+    # flush cost is paid inside the INSERT that crosses the cap). At
+    # 15k logs/s × ~5 attributes the default 4MB cap is crossed every
+    # second, so every INSERT chunk paid a GIN cleanup burst — measured: a
+    # 5000-row INSERT costs 250ms at the default vs 86ms with 128MB; the
+    # flush then happens during autovacuum in the background instead.
+    # pg_stat_statements: per-query timing telemetry (read-only diagnostics;
+    # see loadtest/). autovacuum/analyze throttles: stats must stay fresh
+    # while the table fills 15k rows/s on one CPU, else the planner keeps
+    # scanning. Parallel workers add overhead on a 1-CPU container, so
+    # disable gather (large scans are CPU-bound, not I/O-bound, here).
     command: >
       postgres
       -c shared_buffers=512MB
@@ -27,6 +49,19 @@ services:
       -c min_wal_size=256MB
       -c autovacuum_work_mem=64MB
       -c timezone=UTC
+      -c synchronous_commit=off
+      -c wal_compression=on
+      -c checkpoint_timeout=15min
+      -c gin_pending_list_limit=128MB
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=top
+      -c pg_stat_statements.max=5000
+      -c max_parallel_workers_per_gather=0
+      -c autovacuum_naptime=15s
+      -c autovacuum_analyze_threshold=2000
+      -c autovacuum_analyze_scale_factor=0.01
+      -c autovacuum_vacuum_threshold=50000
+      -c autovacuum_vacuum_scale_factor=0.05
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:

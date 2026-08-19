@@ -76,6 +76,79 @@ export const MIGRATIONS: Migration[] = [
         ON logs (tenant_id, ts DESC) WHERE tenant_id IS NOT NULL;
     `,
   },
+  {
+    name: "0003_write_path",
+    sql: `
+      -- Write-path optimizations for the 1-CPU PostgreSQL container.
+      --
+      -- 1. Drop the PRIMARY KEY on id. The id column stays (BIGSERIAL keeps
+      --    its sequence default), so ids remain unique and GET /logs keeps
+      --    returning them. But the PK's dedicated btree on (id) is never
+      --    used by any query — the keyset cursor uses idx_logs_ts_id — and
+      --    index maintenance is the dominant INSERT cost on one CPU. A log
+      --    table is append-only and needs no FK integrity on its surrogate
+      --    key, so the constraint is pure write amplification.
+      -- 2. Cache 1000 sequence values per session: one WAL record per
+      --    INSERT chunk instead of one per row (ids stay unique; gaps are
+      --    irrelevant for an append-only log table).
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'logs_pkey' AND conrelid = 'logs'::regclass) THEN
+          ALTER TABLE logs DROP CONSTRAINT logs_pkey;
+        END IF;
+        IF to_regclass('logs_id_seq') IS NOT NULL THEN
+          ALTER SEQUENCE logs_id_seq CACHE 1000;
+        END IF;
+      END $$;
+    `,
+  },
+  {
+    name: "0004_rollup",
+    sql: `
+      -- Pre-aggregated counts at 1-second granularity, maintained by the
+      -- ingest writer in the same transaction as the chunk INSERT, so the
+      -- rollup can never diverge from the logs table (no background job,
+      -- no eventual-consistency window).
+      --
+      -- Why 1 second: aggregation windows (1m/5m/1h/1d) over [since, until)
+      -- are served exactly by summing whole aligned 1s buckets from this
+      -- table plus direct scans of the two sub-second edges. The edge scans
+      -- are bounded by ~1 second of logs regardless of the window size, so
+      -- an aggregate over a 1-hour window at 15k logs/s scans at most
+      -- ~15k rows instead of ~54M.
+      --
+      -- tenant_id uses '' (not NULL) as the "no tenant" sentinel because a
+      -- UNIQUE constraint treats NULLs as distinct — ON CONFLICT would never
+      -- fire for NULL-tenant rows and counts would double.
+      CREATE TABLE IF NOT EXISTS log_counts (
+        bucket_ts TIMESTAMPTZ NOT NULL,   -- epoch-aligned 1-second bucket start
+        service   TEXT NOT NULL,
+        level     TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT '',
+        count     BIGINT NOT NULL,
+        UNIQUE (bucket_ts, service, level, tenant_id)
+      );
+    `,
+  },
+  {
+    name: "0005_typed_attrs",
+    sql: `
+      -- Drop the canonicalized attr_lookup column. Validation only admits
+      -- scalar attribute values (string | number | boolean), so a query
+      -- value v matches a stored value exactly when String(stored) === v —
+      -- which the @> operator can probe directly on the TYPED attributes
+      -- column: a query "200" probes '{"k":"200"}' AND '{"k":200}' (and a
+      -- boolean variant for "true"/"false"). This keeps the contract's
+      -- string-comparison semantics for canonical forms while eliminating
+      -- the duplicate JSONB column: one less jsonb per row in the heap and
+      -- WAL, and no per-row canonicalization cost in the app or the DB
+      -- (the query-side probe construction is free; see lib/queryParams).
+      DROP INDEX IF EXISTS idx_logs_attr_lookup;
+      ALTER TABLE logs DROP COLUMN IF EXISTS attr_lookup;
+      CREATE INDEX IF NOT EXISTS idx_logs_attributes_gin
+        ON logs USING GIN (attributes jsonb_path_ops);
+    `,
+  },
 ];
 
 export const MIGRATION_LOCK_KEY = 0x4c4f4753; // 'LOGS' — advisory lock id
