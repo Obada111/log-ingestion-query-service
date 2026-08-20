@@ -1,6 +1,6 @@
 # Log Ingestion & Query Service
 
-A log ingestion & query platform with PostgreSQL-backed storage, cursor-paginated filtering, and time-bucketed aggregations. Designed for sustained ~15,000 logs/s on 0.5 CPU / 256 MB app and 1 CPU / 1 GB PostgreSQL.
+A log ingestion and query platform with PostgreSQL-backed storage, cursor-paginated filtering, and time-bucketed aggregations. Designed for sustained ~15,000 logs/s on 0.5 CPU / 256 MB app and 1 CPU / 1 GB PostgreSQL.
 
 ## Features
 
@@ -59,7 +59,7 @@ node loadtest/loadgen.mjs --mode mixed --rate 15000 --batch 500 --duration 70
 - `ts` — RFC3339 timestamp; up to 5 min in the future, else rejected.
 - `level` — one of `debug | info | warn | error`.
 - `service`, `message` — non-empty strings.
-- `attributes` — object with string/number/boolean values; **nested objects and arrays are NOT supported**; nested values are stored as their JSON string representation.
+- `attributes` — **flat object containing string, number, or boolean values. Nested objects and arrays are NOT supported.**
 
 **200** — `{"accepted": 1, "rejected": [{"index": 0, "reason": "..."}]}`. Rows committed before 200 is sent. Partial batches accepted; each bad entry reported by index with reason (`invalid level: 'critical'`, `invalid timestamp: …`, …).
 
@@ -103,8 +103,8 @@ CREATE TABLE logs (
   level       TEXT NOT NULL CHECK (level IN ('debug','info','warn','error')),
   service     TEXT NOT NULL,
   message     TEXT NOT NULL,
-  attributes  JSONB NOT NULL DEFAULT '{}'::jsonb,  -- original, typed
-  attr_lookup JSONB NOT NULL DEFAULT '{}'::jsonb,  -- canonicalized, string-valued, GIN indexed
+  attributes  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  attr_lookup JSONB NOT NULL DEFAULT '{}'::jsonb,
   tenant_id   TEXT
 );
 
@@ -115,7 +115,7 @@ CREATE INDEX idx_logs_attr_lookup    ON logs USING GIN (attr_lookup jsonb_path_o
 CREATE INDEX idx_logs_tenant_ts      ON logs (tenant_id, ts DESC) WHERE tenant_id IS NOT NULL;
 ```
 
-**Attribute strategy:** The table stores two JSONB columns. `attributes` holds the original payload as-is (typed values round‑trip). `attr_lookup` canonicalizes every value to a string at INSERT time; all `@>` attribute filters run against this column with a GIN `jsonb_path_ops` index, so `attr.<k>=<v>` is an index‑supported equality match while clients still receive typed values.
+The table stores two JSONB columns. `attributes` holds the original payload as-is (typed values round‑trip). `attr_lookup` canonicalizes every value to a string at INSERT time; all `@>` attribute filters run against this column with a GIN `jsonb_path_ops` index, so `attr.<k>=<v>` is an index‑supported equality match while clients still receive typed values.
 
 ## Measured performance (contract-scale run)
 
@@ -141,11 +141,9 @@ Load tooling: `loadtest/loadgen.mjs` (zero‑dep Node; bounded in‑flight; mixe
 - Single instance, in‑memory buffer: writer queue not persisted; on hard crash in‑flight rows are lost (clients can retry — at‑least‑once on the client side).
 - No HA/sharding, no replication, no TLS, no rate limiting — deliberately out of scope.
 
-## Optional features
+## Optional auth
 
-### Auth (default OFF)
-
-Set `AUTH_ENABLED=true` + `LOADGEN_API_KEY=<key>` in the environment before `docker compose up`. Keys are SHA‑256 hashed at startup; the load‑gen key is seeded idempotently. Clients authenticate with `Authorization: Bearer <key>` or `X‑API‑Key: <key>`:
+Set `AUTH_ENABLED=true` + `LOADGEN_API_KEY=<key>` in the environment before `docker compose up`. Keys are SHA-256 hashed at startup; the load‑gen key is seeded idempotently. Clients authenticate with `Authorization: Bearer <key>` or `X‑API‑Key: <key>`:
 
 - `ingest` scope → `POST /logs`
 - `query` scope → `GET /logs` + `GET /logs/aggregate`
@@ -193,4 +191,4 @@ The submission repository does **not** contain a `study/` directory.
 
 ## Project context
 
-This project was developed as a final engineering project for Foothill, focusing on log ingestion, querying, PostgreSQL optimization, reliability, and performance engineering.
+This project was developed as a final engineering project for Foothill, focusing on log ingestion, querying, PostgreSQL storage, and performance under load.
