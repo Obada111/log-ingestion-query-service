@@ -2,7 +2,7 @@
 
 A backend service for ingesting, storing, querying, and aggregating structured logs using TypeScript, Fastify, and PostgreSQL.
 
-The project is designed for high-volume log ingestion and query workloads under the resource limits defined by the project.
+The service was built to handle high-volume log ingestion and queries within the project's resource limits.
 
 ## Features
 
