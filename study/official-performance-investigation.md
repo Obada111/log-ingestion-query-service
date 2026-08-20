@@ -127,3 +127,55 @@ On a healthy engine (89.86 reference): P1 alone is expected to move ingestion p9
 - **Why**: Each checkpoint and ANALYZE costs seconds on the one PG CPU and amplifies p95 under host pressure; these are free-standing tunables with a direct A/B.
 - **How benchmarked**: config diff only → `docker compose up` → official run vs same-session baseline, with `pg_stat_statements`/sampler output for checkpoint counts and PG CPU.
 - **Metric that should improve**: ingestion p95 and PG max CPU (removes periodic stalls), throughput stability across the full run; score should not regress elsewhere.
+
+## Optimization #1 — Writer Encode/Commit Pipelining
+
+Status: **EXPERIMENT RUN AND REVERTED** (2026-08-20). The change was implemented, verified locally, benchmarked head-to-head against a fresh-engine same-day baseline, and did not clear the acceptance gates. Per protocol the code was reverted immediately; only the artifacts, the A/B record, and this documentation remain. **No performance code change is in the tree.**
+
+### Hypothesis
+The writer cycle is serial: chunk N's encode (pure app CPU, ~30–100 ms per 5000-row chunk on the 0.5-CPU app) runs strictly before chunk N's 4-round-trip transaction, and chunk N+1 is not even extracted or encoded until chunk N's COMMIT returns (C3). By overlapping chunk N+1's encoding with chunk N's database work, the writer cycle becomes max(encode, commit) instead of encode + commit, shortening the drain and reducing queue-depth spikes → lower ingestion p95 (weight 0.2 of Performance) with no SQL, schema, or PG work change.
+
+### Implementation (code was reverted; description retained for the record)
+`src/services/ingestWriter.ts` `flush()` was restructured (single file, ~90-line net diff):
+- `tryEncode(chunk)` builds the six parameter arrays (toISOString/JSON.stringify) synchronously, pure CPU; returns a `PreparedChunk`.
+- `commitPrepared(prepared)` runs the existing 4-statement transaction (`BEGIN`, `INSERT_SQL`, `INSERT_COUNTS_SQL`, `COMMIT`) from precomputed arrays, with the existing one-retry-then-reject-all semantics.
+- `flush()` loop: `commitP = commitPrepared(prepared)` → `nextPrepared = tryEncode(takeChunk())` → `await commitP` → swap. The encode of chunk N+1 executes while chunk N's commit awaits PostgreSQL.
+
+### Concurrency model
+Exactly one transaction in flight at any time; exactly one prepared chunk (bounded lookahead of 1). No concurrent writes, so PG-side ordering and visibility across chunks are identical to the serial implementation — a POST resolves only after *its own* chunk commits. FIFO drain order preserved (`takeChunk` unchanged).
+
+### Backpressure model
+Queue semantics unchanged (size-first trigger + wait timer + flush-on-arrival loop); the pipeline adds at most one encoded chunk (~6–8 MB) of app memory (256 MB cap, headroom ~140 MB). Empty tail chunks terminate the loop (guard added; the naive version looped forever on an empty tail).
+
+### Failure propagation and shutdown
+Encode failure rejects that chunk's batches immediately (deterministic, non-retryable); commit failure keeps the existing single retry then rejects every batch in the chunk — never a silent success. `end()` unchanged (clears timer, closes write pool).
+
+### Durability / correctness invariance
+The transaction text and order are unchanged; the retry reuses the same prepared arrays (a failed transaction did not mutate them); resolves still happen only after COMMIT acknowledgment. Correctness suite green before the A/B: typecheck, lint, 37/37 unit, 39/39 integration, contract smoke PASS.
+
+### Before (baseline) — fresh-engine same-day run on untouched commit `dfef261`
+`benchmarks/writer-pipeline-baseline.json`:
+- Score 75.69 (Perf 31.99 / Queries 8.70 / Correctness 15 / Reliability 20), machine speed **0.232x**
+- Load: 12,742/s, p95 **1414 ms**, agg p95 350 ms, errors 0%, dropped k6 iterations **2,709**
+- Sampler: PG avg 21.2% / max 99.3% CPU, 552/847 MiB; app avg 16.2% / max 55.3% CPU, 59/117 MiB
+
+### After (optimized) — fresh engine restart, same session
+`benchmarks/writer-pipeline-optimized.json`:
+- Score 71.50 (Perf 28.65 / Queries 7.85 / Correctness 15 / Reliability 20), machine speed **0.237x**
+- Load: 10,238/s, p95 **1644 ms**, agg p95 397 ms, errors 0%, dropped k6 iterations **5,713**
+- Sampler: PG avg 34.3% / max 101.1% CPU, 524/845 MiB; app avg 23.4% / max 53.1% CPU, 57/116 MiB
+
+### Deltas and gates
+| Gate | Requirement | Result |
+|---|---|---|
+| score | ≥ +1.5 | **−4.19** (75.69 → 71.50) — FAIL |
+| machineSpeed | within ±0.02 | 0.232 → 0.237 (Δ 0.005) — pass |
+| load dropped iterations | within 1.5× | 2,709 → 5,713 (**2.11×**) — **FAIL** |
+| correctness / reliability | 15/15, 20/20 | unchanged — pass |
+| errors | no unexplained increase | 0% → 0% — pass |
+| aggregate/query regression | none | agg 350 → 397 ms, Queries 8.70 → 7.85 — regressed with the run |
+
+Throughput −19.6%, ingestion p95 +230 ms, both inside the identical-code band observed on this machine (±6.6 points, 69.4–76.0 over three runs of unchanged code; load drops 2,382–6,370 in that band). The optimized run's host state was visibly worse: load drop count 2.11× the baseline, PG avg CPU +13 pts, app avg CPU +7 pts, k6 stress/spike/breakpoint memory and CPU all above baseline. No CLI warning beyond the standard generator-limited note.
+
+### Verdict
+**REVERTED — not accepted.** The machine-speed gate passed but the dropped-iterations gate failed (2.11× > 1.5×) and the measured delta was negative and below the +1.5 acceptance threshold. Because even identical code moves 6.6 points and the load drop counts moved 2.11×, neither outcome can be attributed to the change; the mechanism (reduced deterministic p95 floor) was not observable under this host's noise. Per protocol the code was removed and the experiment is recorded here. A future attempt must first demonstrate a comparable host (fresh engine + matched load drops) and should prefer re-running the pipelined A/B on a session with the machine in a stable band. Artifacts archived: `benchmarks/writer-pipeline-baseline.json`, `benchmarks/writer-pipeline-optimized.json`. Reverted commit is uncommitted (git restore of `src/services/ingestWriter.ts` to `dfef261`).
