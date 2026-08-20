@@ -117,6 +117,7 @@ On a healthy engine (89.86 reference): P1 alone is expected to move ingestion p9
 - **Metric that should improve**: ingestion p95 (load), then Performance score; throughput at comparable host state should not regress.
 
 ### 2. One-minute rollup for aggregate interiors
+- **Status**: attempted 2026-08-20 and **reverted** on the A/B gates (see Optimization #2 below); implementation was proven exact locally (0 bucket mismatches, suite green) but the same-session run regressed on score, aggregate p95, load drops and EC.
 - **What**: Migration `0006`: `log_counts_1m (bucket_ts, service, level, tenant_id, count)` with `UNIQUE (…) INCLUDE (count)`; same-transaction upsert `date_bin('1 minute', ts)` in the writer; aggregate builder (rollup path only) answers whole minutes from `log_counts_1m`, sub-minute from `log_counts`, sub-second from `logs` with disjoint, clamped segments.
 - **Why**: The benchmark aggregate scan is O(spanned seconds × 48); a minute rollup makes the interior ~30–60× smaller while staying exact for every window and bucket size (1m/5m/1h/1d all divide minutes).
 - **How benchmarked**: migration + writer + query builder → unit + integration (aggregate exactness across shapes) → official run vs same-session baseline.
@@ -179,3 +180,53 @@ Throughput −19.6%, ingestion p95 +230 ms, both inside the identical-code band 
 
 ### Verdict
 **REVERTED — not accepted.** The machine-speed gate passed but the dropped-iterations gate failed (2.11× > 1.5×) and the measured delta was negative and below the +1.5 acceptance threshold. Because even identical code moves 6.6 points and the load drop counts moved 2.11×, neither outcome can be attributed to the change; the mechanism (reduced deterministic p95 floor) was not observable under this host's noise. Per protocol the code was removed and the experiment is recorded here. A future attempt must first demonstrate a comparable host (fresh engine + matched load drops) and should prefer re-running the pipelined A/B on a session with the machine in a stable band. Artifacts archived: `benchmarks/writer-pipeline-baseline.json`, `benchmarks/writer-pipeline-optimized.json`. Reverted commit is uncommitted (git restore of `src/services/ingestWriter.ts` to `dfef261`).
+
+## Optimization #2 — One-Minute Rollup for Aggregate Interiors
+
+Status: **EXPERIMENT RUN AND REVERTED** (2026-08-20). The change was implemented, verified exact locally, benchmarked head-to-head against a fresh-engine same-day baseline, and did not clear the acceptance gates. Per protocol the code was reverted immediately; only the artifacts, the A/B record, and this documentation remain. **No performance code change is in the tree.**
+
+### Hypothesis
+The benchmark's aggregate queries spend their interior scan in `log_counts` (1-second granularity): ~48 rows × 60 per minute of window, up to ~173k rows scanned per query on the single PG core. A 1-minute rollup (`log_counts_1m`) shrinks the interior ~30–60× while staying exact for every window and bucket size (1m/5m/1h/1d all divide minutes; sub-second edges and partial minutes stay on the fine-grained tables). Expected: lower aggregate p95 (Queries score, 9 points of the total) and lower PG CPU under the 4/s scan workload.
+
+### Implementation (code was reverted; description retained for the record)
+- `src/db/migrations.ts` — migration `0006`: `CREATE TABLE log_counts_1m (bucket_ts timestamptz, service text, level text, tenant_id text, count bigint)` with `CREATE UNIQUE INDEX log_counts_1m_pkey ON log_counts_1m (bucket_ts, service, level, tenant_id) INCLUDE (count)`, plus a backfill `INSERT … SELECT date_bin('1 minute', bucket_ts) … FROM log_counts GROUP BY …` executed at migrate time.
+- `src/services/ingestWriter.ts` — the chunk transaction now runs `INSERT_COUNTS_1M_SQL` (same `ON CONFLICT … DO UPDATE` upsert semantics, `date_bin('1 minute', ts)`) inside the same transaction after `INSERT_COUNTS_SQL`; atomicity with the raw writes and second-level counts is unchanged (POST 200 only after COMMIT).
+- `src/lib/queryParams.ts` — rollup path segments the window: minutes fully inside the window answered from `log_counts_1m`; the sub-minute head/tail from `log_counts`; sub-second bucket edges from `logs`, all clamped and disjoint. Minute-range bounds are inlined as literals (parameterizing them changed the planner's cast handling and broke exact bucket alignment during development; verified both ways).
+- `src/index.ts` — boot/guard `ANALYZE` now covers `log_counts_1m` alongside `log_counts`.
+- Tests updated for the new table (`tests/unit/queryParams.ts` + `tests/integration/api.test.ts`/`helpers.ts` truncate `log_counts_1m`).
+
+### Correctness verification (before the A/B)
+- typecheck + lint clean; 37/37 unit, 39/39 integration, contract smoke PASS.
+- Local proof on a seeded 10-minute dataset: new builder vs old builder on identical data — 10/10 buckets, **0 mismatches**; new 1.6 ms / 46 buffers vs old 11.1 ms / 214 buffers on a quiet single-core PG.
+- HTTP spot-checks exact on: mid-minute windows, service grouping, 5m and 1h buckets.
+
+### Before (baseline) — fresh-engine same-day run on untouched commit `a82bc03`
+`benchmarks/rollup-baseline.json`:
+- Score **85.25** (Perf 38.14 / Queries 12.10 / Correctness 15 / Reliability 20), machine speed **0.295x**
+- Load: 14,932/s, p95 **709 ms**, agg p95 **161 ms**, errors 0%, dropped k6 iterations **81**
+- All scenarios EC, drain deltas 0
+- Sampler: PG avg 19.8% / max 94.7% CPU; app avg 14.7% / max 51.4% CPU
+
+### After (optimized) — fresh engine restart, same session, rollup live
+`benchmarks/rollup-optimized.json`:
+- Score **76.61** (Perf 33.77 / Queries 7.84 / Correctness 15 / Reliability 20), machine speed **0.291x**
+- Load: 14,076/s, p95 **1154 ms**, agg p95 **231 ms**, errors 0%, dropped k6 iterations **1,108**
+- Drain deltas: stress accepted 1,863,300 / visible 429,000; breakpoint accepted 1,103,800 / visible 351,000; **EC 2/4** (load + spike pass)
+- Sampler: PG avg 30.9% / max 99.5% CPU; app avg 22.9% / max 52.2% CPU
+
+### Deltas and gates
+| Gate | Requirement | Result |
+|---|---|---|
+| score | ≥ +1.5 | **−8.64** (85.25 → 76.61) — FAIL |
+| machineSpeed | within ±0.02 | 0.295 → 0.291 (Δ 0.004) — pass |
+| load dropped iterations | within 1.5× | 81 → 1,108 (**13.7×**) — **FAIL** |
+| correctness / reliability | 15/15, 20/20 | unchanged — pass |
+| errors | no unexplained increase | 0% → 0% — pass |
+| aggregate/query improvement | agg p95 improves meaningfully, Queries improves | agg 161 → **231 ms (+70 ms)**, Queries 12.10 → 7.84 — **FAIL** (regressed with the run) |
+| consistency | no regression vs baseline | EC 4/4 → **2/4** with drain deltas — **FAIL** |
+
+### Drain-delta analysis
+The CLI's consistency probe (per its bundled source) first asks the 1-day aggregate for the drain service (10 s timeout; aborts if its companion probe-service count is non-zero), and on any failure falls back to a paginated `GET /logs` cursor walk with a 2 s per-request cap and a bounded drain window — a walk that can only report what it finished reading. On the optimized run the aggregate fallback was hit under saturated single-core PG and the walks returned partial counts (429k / 351k of the accepted totals), which is why drain deltas appeared for the first time this session. This is a measurement-window artifact of the heavier run, not raw-write loss: each accepted chunk commits atomically (logs + both count tables) before the POST 200 and the error rate stayed 0%. However, EC 4/4 → 2/4 is a same-session regression on an established CLI metric and is counted against the experiment regardless of mechanism.
+
+### Verdict
+**REVERTED — not accepted.** Score −8.64 and Queries −4.26 both well below the +1.5 threshold, aggregate p95 regressed (+70 ms) rather than improving, load dropped iterations moved 13.7× the paired baseline (gate limit 1.5×), and EC consistency dropped to 2/4. Because identical code has moved 9 points across sessions (69.4–76.0 band vs today's 85.25 baseline) and the two runs' load-drop counts differ by 13.7×, the host states are not comparable and the rollup's (locally-proven) effect could not be observed or validated. Per protocol the code was removed (git restore of `src/db/migrations.ts`, `src/index.ts`, `src/lib/queryParams.ts`, `src/services/ingestWriter.ts` and the three test files back to `a82bc03`). Artifacts archived: `benchmarks/rollup-baseline.json`, `benchmarks/rollup-optimized.json`. A future attempt must first demonstrate host comparability (fresh engine, matched load drops) and should additionally gate on host CPU bands before the score gate is read.
