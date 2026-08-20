@@ -124,6 +124,7 @@ On a healthy engine (89.86 reference): P1 alone is expected to move ingestion p9
 - **Metric that should improve**: aggregate p95 (Queries score; 9 points of the total) and reduced PG CPU from 4/s scan workload.
 
 ### 3. PG checkpoint/WAL + autovacuum budget
+- **Status**: attempted 2026-08-20, result **inconclusive and reverted** (see Optimization #3 below) — same-session baseline leg ran on a degraded host (machine speed 0.24x, 2,935 load rejects) while the tuned leg hit the best host state observed (0.28x, 33 rejects), so the score delta could not be validated; DB-level counters could not be captured (CLI tears the stack down at the end; the attached live poller silently failed), so per protocol the change was reverted rather than kept unproven. The exact 6-flag diff is recorded in the Optimization #3 section for a confirmatory run.
 - **What**: Config-only: fit `max_wal_size` to the 1 GB cgroup (e.g., 512 MB, with `min_wal_size` ~128 MB) so checkpoint write-back is shallow and frequent rather than a multi-second stall each ~100 s; raise autovacuum ANALYZE thresholds/scale so a pure-ingest run isn't re-analyzed every 15 s on the single core (and align the app's stats guard so it does not duplicate that work).
 - **Why**: Each checkpoint and ANALYZE costs seconds on the one PG CPU and amplifies p95 under host pressure; these are free-standing tunables with a direct A/B.
 - **How benchmarked**: config diff only → `docker compose up` → official run vs same-session baseline, with `pg_stat_statements`/sampler output for checkpoint counts and PG CPU.
@@ -230,3 +231,60 @@ The CLI's consistency probe (per its bundled source) first asks the 1-day aggreg
 
 ### Verdict
 **REVERTED — not accepted.** Score −8.64 and Queries −4.26 both well below the +1.5 threshold, aggregate p95 regressed (+70 ms) rather than improving, load dropped iterations moved 13.7× the paired baseline (gate limit 1.5×), and EC consistency dropped to 2/4. Because identical code has moved 9 points across sessions (69.4–76.0 band vs today's 85.25 baseline) and the two runs' load-drop counts differ by 13.7×, the host states are not comparable and the rollup's (locally-proven) effect could not be observed or validated. Per protocol the code was removed (git restore of `src/db/migrations.ts`, `src/index.ts`, `src/lib/queryParams.ts`, `src/services/ingestWriter.ts` and the three test files back to `a82bc03`). Artifacts archived: `benchmarks/rollup-baseline.json`, `benchmarks/rollup-optimized.json`. A future attempt must first demonstrate host comparability (fresh engine, matched load drops) and should additionally gate on host CPU bands before the score gate is read.
+
+## Optimization #3 — PostgreSQL Checkpoint/WAL/Autovacuum Tuning
+
+Status: **EXPERIMENT RUN — INCONCLUSIVE, CONFIG CHANGE REVERTED** (2026-08-20). The six-flag PostgreSQL configuration change was benchmarked head-to-head on a fresh engine in a single session. The two legs landed on very different host states (the baseline leg on the degraded band, the tuned leg on the best band ever observed), so the score delta cannot be validated; and a poller failure lost the in-database checkpointer/WAL/analyze counters that the protocol requires before keeping a change. Per protocol the change was reverted; the full diff is recorded here for a confirmatory attempt. **No configuration change is in the tree.**
+
+### Hypothesis
+PostgreSQL is capped at 1 CPU and reached ~100% during every official run. Two background costs were suspected of contributing: (a) checkpointing — with `checkpoint_timeout=15min` and `max_wal_size=2GB`, a checkpoint after heavy ingest turns into a multi-second synchronized write-back of hundreds of MB of dirty pages and WAL recycling, contending with the write path on the single core; (b) analysis — with `autovacuum_naptime=15s`, `autovacuum_analyze_threshold=2000`, `autovacuum_analyze_scale_factor=0.01`, autovacuum re-analyzed the fast-growing tables almost every naptime window (at 12–15k rows/s the `logs` churn exceeds the threshold in seconds), duplicating the app's own stats guard (`src/index.ts` re-analyzes `logs`/`log_counts` whenever stats are >10 s stale), and every ANALYZE competes for the same core.
+
+### Current configuration (measured live before the experiment, `pg_settings`)
+`shared_buffers=512MB`, `work_mem=16MB`, `maintenance_work_mem=128MB`, `wal_buffers=16MB`, `max_wal_size=2GB`, `min_wal_size=256MB`, `checkpoint_timeout=15min`, `checkpoint_completion_target=0.9`, `checkpoint_flush_after=256kB` (default), `autovacuum=on`, `autovacuum_max_workers=3`, `autovacuum_naptime=15s`, `autovacuum_vacuum_cost_limit=-1` (200), `autovacuum_vacuum_cost_delay=2ms`, `autovacuum_analyze_scale_factor=0.01`, `autovacuum_analyze_threshold=2000`, `autovacuum_vacuum_scale_factor=0.05` (default), `autovacuum_vacuum_threshold=50000` (default), `log_checkpoints=on`, `synchronous_commit=off`, `wal_compression=pglz`, `gin_pending_list_limit=128MB`, `max_parallel_workers_per_gather=0`, `effective_cache_size=768MB`, `max_connections=50`. PostgreSQL 16 (postgres:16-alpine).
+
+### Measurements before (baseline leg) — fresh engine, current config, same session
+`benchmarks/pg-baseline.json`:
+- Score **75.60** (Perf 31.74 / Queries 8.86 / Correctness 15 / Reliability 20), machine speed **0.2408x**
+- Load: 12,554/s, p95 **1434ms**, agg p95 **341ms**, errors 0%, dropped k6 iterations **2,935**
+- Stress 9,205/s (agg 600ms, drops 17,692); spike 9,658/s (agg 501ms, drops 5,717); breakpoint 9,879/s (agg 593ms, drops 17,393)
+- Consistency: EC 4/4, all visible == accepted (no drain deltas), errors 0%
+- Sampler: PG avg 33.5% / max 100.8% CPU; app avg 24.3% / max 51.9% CPU
+
+### Changeset (exact diff; reverted after the experiment)
+| Parameter | Before | After | Rationale |
+|---|---|---|---|
+| `checkpoint_timeout` | 15min | 5min | Bounds every checkpoint burst to ≤5 minutes of accumulated work regardless of WAL rate; a 15-minute accumulation was the multi-second stall candidate on the single core. |
+| `max_wal_size` | 2GB | 512MB | The 2GB cap (vs 1GB cgroup) let WAL pile up for a 15-minute megaburst; 512MB keeps recycling shallow. With `checkpoint_completion_target=0.9` (unchanged) each burst's writes are spread over 4.5 minutes. |
+| `min_wal_size` | 256MB | 128MB | Keeps ~128MB of recyclable WAL for crash-restore headroom without forcing segment churn, matched to the smaller max. |
+| `autovacuum_naptime` | 15s | 60s | Cuts background worker wakeups from ~4/min to ~1/min on the contended core; vacuum/analyze latency of ≤1 min is irrelevant to the workload. |
+| `autovacuum_analyze_threshold` | 2000 | 10000 | So `logs`'s 12–15k rows/s churn no longer triggers autoanalyze every naptime cycle. |
+| `autovacuum_analyze_scale_factor` | 0.01 | 0.05 | Further defers autoanalyze as tables grow. Freshness is not abandoned: the app's stats guard (unchanged) re-analyzes `logs`/`log_counts` within ~10 s whenever stats age — this change only removes the *duplicated* autoanalyze storms, which is the entire point. |
+
+No resource limits changed. No app code touched. The change is 6 flags in `docker-compose.yml` (commented in-file).
+
+### Measurements after (tuned leg) — fresh stack, same session
+`benchmarks/pg-optimized.json`:
+- Score **87.00** (Perf 39.19 / Queries 12.77 / Correctness 15 / Reliability 20), machine speed **0.2826x**
+- Load: 14,972/s, p95 **619ms**, agg p95 **124ms**, errors 0%, dropped k6 iterations **33**
+- All scenarios EC 4/4, all visible == accepted, errors 0%
+- Sampler: PG avg 31.5% / max 96.3% CPU; app avg 23.8% / max 51.6% CPU
+
+### Deltas and gates
+| Gate | Requirement | Same-session result |
+|---|---|---|
+| machineSpeed | within ±0.02 | 0.2408 → 0.2826 (Δ **0.042**) — **FAIL** (hosts differ) |
+| load dropped iterations | within 1.5× | 2,935 → 33 (**~90×**) — **FAIL** (hosts differ) |
+| score | ≥ +1.5, comparable host | +11.40 — cannot be attributed to the change alone |
+| correctness / reliability | 15/15, 20/20 | 15/15, 20/20 both legs — pass |
+| consistency / errors | no regression | EC 4/4 both legs, drain deltas 0 both legs, 0% errors — pass |
+| aggregate p95 | no regression | 341 → 124ms baseline-pair; 161 → 124ms vs best-state identical-code run — improved |
+| load throughput | no regression | 12,554 → 14,972/s (baseline-pair); 14,932 → 14,972/s (best-state pair) — improved |
+| ingestion p95 | improve meaningfully | 1434 → 619ms (baseline-pair); 709 → 619ms (best-state pair) — improved |
+
+Cross-session best-state pairing (identical code, `benchmarks/rollup-baseline.json`: 85.24 / 0.2946x / 81 drops / agg 161ms — the best host state ever observed): the tuned leg at 0.2826x (Δ −0.012 within ±0.02) and 33 drops (within 1.5× of 81) meets the comparability gates, and every graded metric improved (score 87.00 vs 85.24, agg p95 124 vs 161ms, Queries 12.77 vs 12.10, ingestion p95 619 vs 709ms) with correctness/reliability/EC held. PG-efficiency signal (directional, hosts differ): rows·s⁻¹ per PG CPU point rose from 12,554/33.5 = 375 to 14,972/31.5 = 475 (+27%) — more throughput on *less* average PG CPU, consistent with fewer ANALYZE storms and shallower checkpoints.
+
+### What could not be measured
+In-database counters (checkpoint count/write-time/sync-time, WAL bytes, autoanalyze/autovacuum counts, dead-tuple levels, WAL-dir growth) from either leg could not be recovered: the CLI tears the stack down (and removes its volume) at the end of a run, and the live poller attached to the tuned leg silently failed to log. The protocol requires database-level evidence before keeping a change whose score signal sits on non-comparable host states — that evidence is absent, so the experiment can only be recorded as inconclusive.
+
+### Verdict
+**INCONCLUSIVE — configuration change REVERTED.** Nothing regressed in any metric on any leg (throughput, both p95s, CPU, reliability, consistency all equal-or-better; 15/15, 20/20, EC 4/4, 0% errors, zero drain deltas in both legs), and the mechanism is coherent with the measured behavior. But the same-session A/B landed on host states that fail the machine-speed (±0.02) and dropped-iterations (1.5×) comparability gates by a wide margin, and the database-level measurements were lost to a poller failure — two of the three planks the protocol needs for a validated keep. Per the protocol ("do not keep a configuration change just because one metric improved"; "report the benchmark as inconclusive"), the change was reverted (`git restore docker-compose.yml` back to `4c39675`). The exact 6-flag diff above is the reapply recipe for a confirmatory A/B, which must: (1) run a fresh-engine baseline and tuned leg in the SAME host band (machine speed ±0.02, load drops within 1.5×), and (2) attach a working live PG poller to *both* legs from start to end to capture checkpointer/WAL/analyze deltas before the CLI's teardown. Artifacts archived: `benchmarks/pg-baseline.json`, `benchmarks/pg-optimized.json`.
