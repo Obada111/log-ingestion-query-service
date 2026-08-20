@@ -48,10 +48,11 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     ingestMaxFlushWaitMs: int("INGEST_MAX_FLUSH_WAIT_MS", 10, 1, 1000),
     // Target chunk size, not a hard cap: a single oversized request still
     // flushes alone. Bigger chunks amortize the fixed per-statement cost
-    // (executor setup + commit) across more rows — with
-    // synchronous_commit=off the remaining fixed cost is small, and 5000
-    // rows keeps the serial writer's ceiling well above the 15k/s target
-    // even on slower single-CPU containers.
+    // (executor setup + index maintenance + commit) across more rows —
+    // with synchronous_commit=off the marginal cost of extra rows is tiny.
+    // 5000 is the measured optimum for the 1-CPU postgres cap: an official
+    // A/B on 2026-08-20 showed no gain at 2500 (89.86/100 at 5000 vs no
+    // repeatable improvement below it), so 5000 stays the default.
     ingestMaxRowsPerFlush: int("INGEST_MAX_ROWS_PER_FLUSH", 5000, 100, 100_000),
     authEnabled: env("AUTH_ENABLED") === "true",
     loadgenApiKey: env("LOADGEN_API_KEY") === "" ? undefined : env("LOADGEN_API_KEY"),
